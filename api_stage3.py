@@ -4,7 +4,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 from loguru import logger
-from simulation_stage3 import SimulationParams, run_simulation, get_status, pause_simulation, resume_simulation, stop_simulation
+from simulation_stage3 import (
+    SimulationParams,
+    run_simulation,
+    get_status,
+    pause_simulation,
+    resume_simulation,
+    stop_simulation,
+)
 
 app = FastAPI()
 app.add_middleware(
@@ -34,6 +41,10 @@ def start_simulation_thread(params: APIParams):
     )
     thread = threading.Thread(target=run_simulation, args=(sim_params,), daemon=True)
     thread.start()
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
 
 @app.post("/simulate")
 def simulate(params: APIParams, background_tasks: BackgroundTasks):
