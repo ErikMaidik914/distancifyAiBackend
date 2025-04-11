@@ -1,80 +1,58 @@
-import requests
-import math
-import time
-import threading
+import requests, math, time, threading
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from loguru import logger
 from scipy.spatial import KDTree
 
-# Configuration
 BASE = "http://localhost:5000"
-DEBUG_MODE = False  # Set to True for detailed logging
+DEBUG_MODE = False
 
 session = requests.Session()
-
-# Global counters and locks
 active_lock = threading.Lock()
-active_count = 0
-local_dispatch_count = 0  # Local counter for successful dispatches
-
-# Local supply data (cached once)
-local_supply = {}  # Key: (county, city) -> { 'quantity', 'latitude', 'longitude' }
 supply_lock = threading.Lock()
-supply_points = []  # List of (latitude, longitude)
-supply_keys = []    # List of (county, city)
+active_count = 0
+local_dispatch_count = 0
+local_supply = {}
+supply_points = []
+supply_keys = []
 kdtree = None
 
-def dist(ax, ay, bx, by):
-    return math.sqrt((ax - bx) ** 2 + (ay - by) ** 2)
-
 def initialize_supply():
+    global kdtree
     r = session.get(f"{BASE}/medical/search")
     if r.ok:
         data = r.json()
         with supply_lock:
             for entry in data:
                 key = (entry["county"], entry["city"])
-                local_supply[key] = {
-                    "quantity": entry["quantity"],
-                    "latitude": entry["latitude"],
-                    "longitude": entry["longitude"]
-                }
+                local_supply[key] = {"quantity": entry["quantity"], "latitude": entry["latitude"], "longitude": entry["longitude"]}
                 supply_keys.append(key)
                 supply_points.append((entry["latitude"], entry["longitude"]))
-        global kdtree
         kdtree = KDTree(supply_points)
-        logger.info("Initial supply loaded and KDTree built; using local cache.")
+        logger.info("Supply loaded and KDTree built.")
     else:
-        logger.error("Initial supply loading failed: {} {}", r.status_code, r.text)
+        logger.error("Supply loading failed: {} {}", r.status_code, r.text)
 
 def dispatch(srcCounty, srcCity, tgtCounty, tgtCity, qty):
-    data = {
-        "sourceCounty": srcCounty,
-        "sourceCity": srcCity,
-        "targetCounty": tgtCounty,
-        "targetCity": tgtCity,
-        "quantity": qty
-    }
+    data = {"sourceCounty": srcCounty, "sourceCity": srcCity, "targetCounty": tgtCounty, "targetCity": tgtCity, "quantity": qty}
     r = session.post(f"{BASE}/medical/dispatch", json=data)
     if r.ok:
         if DEBUG_MODE:
             logger.debug("Dispatched {} from {} {} to {} {}", qty, srcCity, srcCounty, tgtCity, tgtCounty)
         return True
-    else:
-        logger.error("Dispatch failed from {} {} to {} {}: {} {}", srcCity, srcCounty, tgtCity, tgtCounty, r.status_code, r.text)
-        return False
+    logger.error("Dispatch failed from {} {} to {} {}: {} {}", srcCity, srcCounty, tgtCity, tgtCounty, r.status_code, r.text)
+    return False
 
 def process_emergency(call):
-    global local_dispatch_count
+    global local_dispatch_count, active_count
     needed = sum(req["Quantity"] for req in call.get("requests", []))
     if needed <= 0:
-        logger.debug("Emergency at {} {} requires no ambulances.", call["city"], call["county"])
+        logger.debug("No ambulances required at {} {}.", call["city"], call["county"])
+        with active_lock:
+            active_count -= 1
         return
-
-    emergency_point = (call["latitude"], call["longitude"])
-    distances, indices = kdtree.query(emergency_point, k=len(supply_points))
+    pt = (call["latitude"], call["longitude"])
+    distances, indices = kdtree.query(pt, k=len(supply_points))
     remaining = needed
-
     with supply_lock:
         for idx in indices:
             key = supply_keys[idx]
@@ -87,28 +65,26 @@ def process_emergency(call):
                 remaining -= use
                 local_dispatch_count += use
                 if DEBUG_MODE:
-                    logger.debug("Local dispatch count updated: {}", local_dispatch_count)
+                    logger.debug("Dispatch count updated: {}", local_dispatch_count)
                 if remaining <= 0:
                     break
             else:
-                logger.error("Dispatch error for emergency at {} {}.", call["city"], call["county"])
+                logger.error("Dispatch error at {} {}.", call["city"], call["county"])
     if remaining > 0:
-        logger.warning("Emergency at {} {} not fully dispatched; missing {} ambulances.", call["city"], call["county"], remaining)
-
+        logger.warning("Not fully dispatched at {} {}; missing {} ambulances.", call["city"], call["county"], remaining)
     with active_lock:
-        global active_count
         active_count -= 1
-        logger.info("Processed emergency at {} {}. Active emergencies: {}", call["city"], call["county"], active_count)
+        logger.info("Processed emergency at {} {}. Active: {}", call["city"], call["county"], active_count)
 
 def get_next_emergency():
     r = session.get(f"{BASE}/calls/next")
     if r.status_code == 404:
         return None
-    elif r.ok:
+    if r.ok:
         try:
             return r.json()
         except Exception as e:
-            logger.error("JSON parse error from /calls/next: {} {}", e, r.text)
+            logger.error("JSON parse error: {} {}", e, r.text)
     else:
         logger.error("Error calling /calls/next: {} {}", r.status_code, r.text)
     return None
@@ -127,49 +103,36 @@ def main(seed="default", targetDispatches=100, maxActiveCalls=15, poll_interval=
         logger.error("Reset failed: {} {}", r.status_code, r.text)
         return
     logger.info("Simulation reset: {}", r.json())
-
     initialize_supply()
     executor = ThreadPoolExecutor(max_workers=maxActiveCalls)
     futures = []
     global active_count, local_dispatch_count
-
     last_status_check = time.time()
-    while True:
-        # Local check using our own counter.
-        if local_dispatch_count >= targetDispatches:
-            logger.info("Local target dispatches reached: {}. Stopping simulation.", local_dispatch_count)
-            break
 
-        # Perform a status check less frequently for cross-validation.
+    while True:
+        if local_dispatch_count >= targetDispatches:
+            logger.info("Local target reached: {}.", local_dispatch_count)
+            break
         if time.time() - last_status_check >= status_interval:
             status = get_status()
-            if status:
-                remote_dispatches = status.get("totalDispatches", 0)
-                logger.info("Status check: remote dispatches = {} (local = {})", remote_dispatches, local_dispatch_count)
-                if remote_dispatches >= targetDispatches:
-                    logger.info("Remote target dispatches reached. Stopping simulation.")
-                    break
+            if status and status.get("totalDispatches", 0) >= targetDispatches:
+                logger.info("Remote target reached.")
+                break
             last_status_check = time.time()
-
         with active_lock:
-            current_active = active_count
-        if current_active < maxActiveCalls:
+            current = active_count
+        if current < maxActiveCalls:
             emergency = get_next_emergency()
             if emergency:
                 with active_lock:
                     active_count += 1
                 futures.append(executor.submit(process_emergency, emergency))
-                logger.info("Submitted emergency at {} {}. Active count: {}",
-                            emergency["city"], emergency["county"], active_count)
+                logger.info("Submitted emergency at {} {}. Active: {}", emergency["city"], emergency["county"], active_count)
             else:
                 time.sleep(poll_interval)
         else:
             time.sleep(poll_interval)
-
-        if futures:
-            done, not_done = wait(futures, timeout=1, return_when=FIRST_COMPLETED)
-            futures = list(not_done)
-
+        futures = [f for f in futures if not f.done()]
     stop = session.post(f"{BASE}/control/stop")
     if stop.ok:
         logger.info("Simulation stopped: {}", stop.json())
