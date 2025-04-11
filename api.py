@@ -1,26 +1,19 @@
-import asyncio
 import threading
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 from loguru import logger
-from simulation import SimulationParams, run_simulation, get_status
+from simulation import SimulationParams, run_simulation, get_status, pause_simulation, resume_simulation, stop_simulation
 
 app = FastAPI()
-MAIN_LOOP = None
-
-@app.on_event("startup")
-async def on_startup():
-    global MAIN_LOOP
-    MAIN_LOOP = asyncio.get_running_loop()
-
-class WSMessage(BaseModel):
-    event: str
-    local_dispatch_count: int = 0
-    active_count: int = 0
-    city: str = ""
-    county: str = ""
-    timestamp: float
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 class APIParams(BaseModel):
     api_url: str = ""
@@ -30,25 +23,7 @@ class APIParams(BaseModel):
     poll_interval: float = 0.3
     status_interval: float = 5
 
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections = []
-
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
-
-    async def broadcast(self, message: str):
-        for connection in self.active_connections:
-            await connection.send_text(message)
-
-manager = ConnectionManager()
-
 def start_simulation_thread(params: APIParams):
-    global MAIN_LOOP
     sim_params = SimulationParams(
         api_url=params.api_url,
         seed=params.seed,
@@ -57,17 +32,28 @@ def start_simulation_thread(params: APIParams):
         poll_interval=params.poll_interval,
         status_interval=params.status_interval
     )
-    thread = threading.Thread(
-        target=run_simulation,
-        args=(sim_params, manager.broadcast, MAIN_LOOP),  # Pass the main loop here
-        daemon=True
-    )
+    thread = threading.Thread(target=run_simulation, args=(sim_params,), daemon=True)
     thread.start()
 
 @app.post("/simulate")
 def simulate(params: APIParams, background_tasks: BackgroundTasks):
     background_tasks.add_task(start_simulation_thread, params)
     return {"status": "simulation started", "params": params.dict()}
+
+@app.post("/simulate/pause")
+def pause():
+    pause_simulation()
+    return {"status": "simulation paused"}
+
+@app.post("/simulate/resume")
+def resume():
+    resume_simulation()
+    return {"status": "simulation resumed"}
+
+@app.post("/simulate/stop")
+def stop():
+    stop_simulation()
+    return {"status": "simulation stopped"}
 
 @app.get("/simulate/status")
 def simulation_status():
@@ -76,15 +62,5 @@ def simulation_status():
         raise HTTPException(status_code=500, detail="Error fetching simulation status")
     return s
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-        logger.info("WebSocket disconnected.")
-
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)

@@ -1,8 +1,6 @@
 import os
 import time
 import threading
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -10,6 +8,18 @@ from loguru import logger
 from scipy.spatial import KDTree
 
 SESSION = None
+PAUSE_EVENT = threading.Event()
+PAUSE_EVENT.set()
+STOP_EVENT = threading.Event()
+
+def pause_simulation():
+    PAUSE_EVENT.clear()
+
+def resume_simulation():
+    PAUSE_EVENT.set()
+
+def stop_simulation():
+    STOP_EVENT.set()
 
 class SimulationParams:
     def __init__(
@@ -84,7 +94,7 @@ def get_status():
         return None
     return _get_status(SESSION)
 
-def run_simulation(params, broadcast, loop):
+def run_simulation(params):
     global SESSION
     SESSION = create_session(params.api_url)
     local_supply = {}
@@ -92,25 +102,18 @@ def run_simulation(params, broadcast, loop):
     supply_keys = []
     active_count = 0
     local_dispatch_count = 0
-
     reset_url = f"{SESSION.base_url}/control/reset?seed={params.seed}&targetDispatches={params.targetDispatches}&maxActiveCalls={params.maxActiveCalls}"
     r = SESSION.post(reset_url)
     if not r.ok:
-        logger.error("Reset call failed: {} {}", r.status_code, r.text)
+        logger.error(f"Reset call failed: {r.status_code} {r.text}")
         return
-
     try:
         local_supply, tree_obj, supply_keys = _initialize_supply(SESSION)
     except Exception as e:
-        logger.error("Supply initialization failed: {}", e)
+        logger.error(f"Supply initialization failed: {e}")
         return
-
     tree = tree_obj
     lock = threading.Lock()
-    pool = ThreadPoolExecutor(max_workers=params.maxActiveCalls)
-    futures = []
-    last_status_check = time.time()
-
     def process_emergency(call):
         nonlocal active_count, local_dispatch_count
         needed = sum(x["Quantity"] for x in call.get("requests", []))
@@ -125,7 +128,8 @@ def run_simulation(params, broadcast, loop):
             for i in idxs:
                 key = supply_keys[i]
                 av = local_supply[key]["quantity"]
-                if av <= 0: continue
+                if av <= 0:
+                    continue
                 use = min(av, remain)
                 ok = _dispatch(SESSION, key[0], key[1], call["county"], call["city"], use)
                 if ok:
@@ -135,15 +139,12 @@ def run_simulation(params, broadcast, loop):
                 if remain <= 0:
                     break
             active_count -= 1
-        asyncio.run_coroutine_threadsafe(
-            broadcast(
-                f'{{"event":"update","city":"{call["city"]}","county":"{call["county"]}",'
-                f'"active_count":{active_count},"local_dispatch_count":{local_dispatch_count}}}'
-            ),
-            loop
-        )
-
+    threads = []
+    last_status_check = time.time()
     while True:
+        if STOP_EVENT.is_set():
+            break
+        PAUSE_EVENT.wait()
         if local_dispatch_count >= params.targetDispatches:
             break
         if time.time() - last_status_check >= params.status_interval:
@@ -151,32 +152,29 @@ def run_simulation(params, broadcast, loop):
             if st and st.get("totalDispatches", 0) >= params.targetDispatches:
                 break
             last_status_check = time.time()
-
         with lock:
             curr = active_count
         if curr < params.maxActiveCalls:
             try:
                 call = _get_next_emergency(SESSION)
             except Exception as e:
-                logger.error("Error fetching call: {}", e)
+                logger.error(f"Error fetching call: {e}")
                 time.sleep(params.poll_interval)
                 continue
             if call:
                 with lock:
                     active_count += 1
-                futures.append(pool.submit(process_emergency, call))
-                msg = f'{{"event":"update","city":"{call["city"]}","county":"{call["county"]}",'
-                msg += f'"active_count":{active_count},"local_dispatch_count":{local_dispatch_count}}}'
-                asyncio.run_coroutine_threadsafe(broadcast(msg), loop)
+                t = threading.Thread(target=process_emergency, args=(call,))
+                t.start()
+                threads.append(t)
             else:
                 time.sleep(params.poll_interval)
         else:
             time.sleep(params.poll_interval)
-
-        futures = [f for f in futures if not f.done()]
-
+        threads = [t for t in threads if t.is_alive()]
     stop = SESSION.post(f"{SESSION.base_url}/control/stop")
     if not stop.ok:
-        logger.error("Stop call failed: {} {}", stop.status_code, stop.text)
-    complete_msg = f'{{"event":"complete","local_dispatch_count":{local_dispatch_count},"timestamp":{time.time()}}}'
-    asyncio.run_coroutine_threadsafe(broadcast(complete_msg), loop)
+        logger.error(f"Stop call failed: {stop.status_code} {stop.text}")
+    for t in threads:
+        t.join()
+    STOP_EVENT.clear()
