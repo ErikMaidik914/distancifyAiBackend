@@ -48,9 +48,9 @@ def auth_login(session):
     return None
 
 def auth_refresh(session):
-    refresh_url = f"{session.base_url}/auth/refresh_token"
-    payload = {"token": session._token, "refreshToken": session._refresh_token}
-    response = request_with_retry(session, "POST", refresh_url, json=payload, timeout=5)
+    refresh_url = f"{session.base_url}/auth/refreshtoken"
+    headers = {"refresh_token": session._refresh_token}
+    response = request_with_retry(session, "POST", refresh_url, headers=headers, timeout=5)
     if response:
         data = response.json()
         session._token = data.get("token")
