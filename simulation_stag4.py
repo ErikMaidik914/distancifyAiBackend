@@ -1,259 +1,237 @@
 import os
-import sys
 import time
 import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from loguru import logger
 from scipy.spatial import KDTree
-from concurrent.futures import ThreadPoolExecutor
 
-# Enable debug logging to stdout
-logger.add(sys.stdout, level="DEBUG")
-
-# Global simulation state variables
-SESSION = None
 PAUSE_EVENT = threading.Event()
 PAUSE_EVENT.set()
 STOP_EVENT = threading.Event()
 
-# Control functions for pausing, resuming, and stopping the simulation
-def pause_simulation():
-    PAUSE_EVENT.clear()
-
-def resume_simulation():
-    PAUSE_EVENT.set()
-
-def stop_simulation():
-    STOP_EVENT.set()
-
-# Simulation configuration wrapper
 class SimulationParams:
-    def __init__(self, api_url=None, seed="default", targetDispatches=100, maxActiveCalls=15, poll_interval=0.3, status_interval=5):
+    def __init__(self, api_url=None, seed="default", targetDispatches=100, maxActiveCalls=15, poll_interval=0.3, status_interval=5, emergency_types=None, debug_mode=False):
         self.api_url = api_url or os.environ.get("API_BASE_URL", "http://localhost:5000")
         self.seed = seed
         self.targetDispatches = targetDispatches
         self.maxActiveCalls = maxActiveCalls
         self.poll_interval = poll_interval
         self.status_interval = status_interval
+        self.emergency_types = emergency_types or ["Medical", "Fire", "Police", "Rescue", "Utility"]
+        self.debug_mode = debug_mode
 
-# HTTP session with retry capabilities
 def create_session(base_url, retries=3, backoff=0.5):
     s = requests.Session()
-    r = Retry(total=retries, backoff_factor=backoff, status_forcelist=[500, 502, 503, 504])
-    a = HTTPAdapter(max_retries=r)
-    s.mount("http://", a)
-    s.mount("https://", a)
+    r = Retry(total=retries, backoff_factor=backoff, status_forcelist=[500,502,503,504])
+    adapter = HTTPAdapter(max_retries=r)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
     s.base_url = base_url
     return s
 
-# Wrapper for GET requests with error handling and timeout
-def safe_get(session, url, timeout=5):
-    try:
-        resp = session.get(url, timeout=timeout)
-        resp.raise_for_status()
-        return resp
-    except Exception as e:
-        logger.error(f"GET {url} failed: {e}")
-        return None
+def request_with_retry(session, method, url, max_retries=3, backoff=0.5, **kwargs):
+    for attempt in range(max_retries):
+        try:
+            response = session.request(method, url, **kwargs)
+            if response.ok:
+                return response
+            if response.text and "Not started" in response.text:
+                logger.error("Request {} {} returned 'Not started'.", method, url)
+                return None
+            logger.error("Request {} {} failed attempt {}: {} {}", method, url, attempt+1, response.status_code, response.text)
+        except Exception as e:
+            logger.error("Request {} {} error attempt {}: {}", method, url, attempt+1, e)
+        time.sleep(backoff * (2 ** attempt))
+    return None
 
-# Wrapper for POST requests with error handling and timeout
-def safe_post(session, url, json=None, timeout=5):
-    try:
-        resp = session.post(url, json=json, timeout=timeout)
-        return resp
-    except Exception as e:
-        logger.error(f"POST {url} failed: {e}")
-        return None
+def initialize_supply(session, emergency_types):
+    supplies = {}
+    for etype in emergency_types:
+        url = f"{session.base_url}/{etype.lower()}/search"
+        resp = request_with_retry(session, "GET", url, timeout=5)
+        if resp:
+            data = resp.json()
+            local_supply = []
+            supply_keys = []
+            supply_points = []
+            for entry in data:
+                qty = entry.get("quantity", 0)
+                lat = entry.get("latitude")
+                lon = entry.get("longitude")
+                county = entry.get("county")
+                city = entry.get("city")
+                if qty is None or qty < 0:
+                    qty = 0
+                if lat is None or lon is None or not county or not city or county.strip() == "":
+                    continue
+                key = (county.strip(), city.strip())
+                local_supply.append({"key": key, "quantity": qty, "lat": lat, "lon": lon})
+                supply_keys.append(key)
+                supply_points.append((lat, lon))
+            tree = KDTree(supply_points) if supply_points else None
+            supplies[etype] = {"local_supply": local_supply, "supply_keys": supply_keys, "supply_points": supply_points, "tree": tree}
+            logger.info("{} supply loaded.", etype)
+        else:
+            logger.error("{} supply loading failed.", etype)
+    return supplies
 
-# Fetch and build initial KDTree of all supply points
-def _initialize_supply(session):
-    supply_data = {}
-    url = f"{session.base_url}/medical/search"
-    resp = safe_get(session, url)
-    if not resp:
-        raise Exception("Supply initialization failed")
-    data = resp.json()
-    points, keys = [], []
-    for d in data:
-        if d.get("quantity", -1) < 0 or d.get("latitude") is None or d.get("longitude") is None:
-            continue
-        k = (d["county"], d["city"])
-        supply_data[k] = {"quantity": d["quantity"], "lat": d["latitude"], "lon": d["longitude"]}
-        keys.append(k)
-        points.append((d["latitude"], d["longitude"]))
-    return supply_data, KDTree(points), keys
+def refresh_supply_by_city(session, etype, county, city):
+    url = f"{session.base_url}/{etype.lower()}/searchbycity?county={county}&city={city}"
+    resp = request_with_retry(session, "GET", url, timeout=3)
+    if resp:
+        data = resp.json()
+        total = 0
+        if isinstance(data, list):
+            for entry in data:
+                qty = entry.get("quantity", 0)
+                if qty is None or qty < 0:
+                    qty = 0
+                total += qty
+        elif isinstance(data, dict):
+            qty = data.get("quantity", 0)
+            if qty is None or qty < 0:
+                qty = 0
+            total = qty
+        elif isinstance(data, int):
+            total = data
+        return total
+    logger.error("Failed to refresh supply for {} {} {}.", etype, county, city)
+    return 0
 
-# Refresh real-time quantity of supply for a specific city
-def refresh_supply(session, county, city):
-    url = f"{session.base_url}/medical/searchbycity?county={county}&city={city}"
-    resp = safe_get(session, url)
-    if not resp:
-        raise Exception("Refresh supply failed")
-    data = resp.json()
-    if isinstance(data, int):
-        return {"quantity": data}
-    if data is None or data.get("quantity", -1) < 0:
-        raise Exception("Bad data from refresh supply")
-    return data
+def dispatch(session, etype, srcCounty, srcCity, tgtCounty, tgtCity, qty, debug_mode=False):
+    url = f"{session.base_url}/{etype.lower()}/dispatch"
+    payload = {"sourceCounty": srcCounty, "sourceCity": srcCity, "targetCounty": tgtCounty, "targetCity": tgtCity, "quantity": qty}
+    resp = request_with_retry(session, "POST", url, json=payload, timeout=5)
+    if resp:
+        if debug_mode:
+            logger.debug("Dispatched {} {} from {} {} to {} {}.", qty, etype, srcCity, srcCounty, tgtCity, tgtCounty)
+        return True
+    logger.error("Dispatch failed for {} from {} {} to {} {}.", etype, srcCity, srcCounty, tgtCity, tgtCounty)
+    return False
 
-# Dispatch supply from source to target
-def _dispatch(session, srcCounty, srcCity, tgtCounty, tgtCity, qty):
-    url = f"{session.base_url}/medical/dispatch"
-    resp = safe_post(session, url, json={
-        "sourceCounty": srcCounty,
-        "sourceCity": srcCity,
-        "targetCounty": tgtCounty,
-        "targetCity": tgtCity,
-        "quantity": qty
-    })
-    if not resp or not resp.ok:
-        logger.error(f"Dispatch from {srcCounty}-{srcCity} to {tgtCounty}-{tgtCity} failed")
-        return False
-    return True
-
-# Fetch the next emergency call from the backend
-def _get_next_emergency(session):
+def get_next_emergency(session):
     url = f"{session.base_url}/calls/next"
-    resp = safe_get(session, url)
-    if not resp:
-        return None
-    if resp.status_code == 404:
-        return None
-    data = resp.json()
-    required = ["latitude", "longitude", "county", "city", "requests"]
-    if not all(k in data for k in required):
-        raise Exception("Bad emergency call data")
-    return data
+    resp = request_with_retry(session, "GET", url, timeout=5)
+    if resp:
+        if resp.status_code == 404:
+            return None
+        return resp.json()
+    logger.error("Error calling /calls/next.")
+    return None
 
-# Get simulation status from backend
-def _get_status(session):
+def get_status(session):
     url = f"{session.base_url}/control/status"
-    resp = safe_get(session, url)
-    return resp.json() if resp and resp.ok else None
+    resp = request_with_retry(session, "GET", url, timeout=5)
+    if resp:
+        return resp.json()
+    logger.error("Error fetching status.")
+    return None
 
-# Public status endpoint
-def get_status():
-    if SESSION is None:
-        return None
-    return _get_status(SESSION)
-
-# Main simulation execution logic
 def run_simulation(params):
-    global SESSION
-    SESSION = create_session(params.api_url)
-    local_supply = {}
-    tree = None
-    supply_keys = []
+    session = create_session(params.api_url)
+    reset_url = f"{session.base_url}/control/reset?seed={params.seed}&targetDispatches={params.targetDispatches}&maxActiveCalls={params.maxActiveCalls}"
+    r = request_with_retry(session, "POST", reset_url, timeout=5)
+    if r is None:
+        logger.error("Reset failed.")
+        return
+    logger.info("Simulation reset: {}", r.json())
+    supplies = initialize_supply(session, params.emergency_types)
+    active_lock = threading.Lock()
+    supply_lock = threading.Lock()
     active_count = 0
     local_dispatch_count = 0
-
-    # Reset backend simulation state
-    reset_url = f"{SESSION.base_url}/control/reset?seed={params.seed}&targetDispatches={params.targetDispatches}&maxActiveCalls={params.maxActiveCalls}"
-    r = safe_post(SESSION, reset_url)
-    if not r or not r.ok:
-        logger.error(f"Reset failed: {r.status_code if r else 'No response'}")
-        return
-
-    # Build spatial tree for all available supply points
-    try:
-        local_supply, tree_obj, supply_keys = _initialize_supply(SESSION)
-    except Exception as e:
-        logger.error(f"Supply initialization failed: {e}")
-        return
-
-    tree = tree_obj
-    lock = threading.Lock()
-    pool = ThreadPoolExecutor(max_workers=params.maxActiveCalls)
+    pool = ThreadPoolExecutor(max_workers=40)
     futures = []
     last_status_check = time.time()
-
-    # Thread worker to handle an individual emergency call
+    stop_fetching = False
     def process_emergency(call):
         nonlocal active_count, local_dispatch_count
-        needed = sum(x["Quantity"] for x in call.get("requests", []))
-        if needed <= 0:
-            with lock:
-                active_count -= 1
-            return
-        pt = (call["latitude"], call["longitude"])
-        _, idxs = tree.query(pt, k=len(supply_keys))
-        remain = needed
-        with lock:
-            for i in idxs:
-                key = supply_keys[i]
-                try:
-                    updated = refresh_supply(SESSION, key[0], key[1])
-                    local_supply[key]["quantity"] = updated["quantity"]
-                except Exception as e:
-                    logger.error(f"Failed to refresh supply for {key}: {e}")
-                    continue
-                av = local_supply[key]["quantity"]
-                if av <= 0:
-                    continue
-                use = min(av, remain)
-                if use <= 0:
-                    continue
-                if _dispatch(SESSION, key[0], key[1], call["county"], call["city"], use):
-                    local_supply[key]["quantity"] -= use
-                    remain -= use
-                    local_dispatch_count += use
-                    logger.debug(f"Dispatched {use} from {key} to {call['county']}-{call['city']} (Remaining need: {remain})")
-                else:
-                    logger.error(f"Dispatch failed for {key} to {call['county']}-{call['city']}")
-                if remain <= 0:
-                    break
-            if remain > 0:
-                logger.warning(f"Emergency {call['county']}-{call['city']} not fully served. Remaining: {remain}")
+        for req in call.get("requests", []):
+            needed = req.get("Quantity", 0)
+            if needed <= 0:
+                logger.debug("No {} units required at {} {}.", req.get("Type"), call.get("city"), call.get("county"))
+                continue
+            supply_data = supplies.get(req.get("Type"))
+            if not supply_data or not supply_data["tree"]:
+                logger.error("No supply available for {}.", req.get("Type"))
+                continue
+            pt = (call.get("latitude"), call.get("longitude"))
+            distances, indices = supply_data["tree"].query(pt, k=len(supply_data["supply_points"]))
+            remaining = needed
+            with supply_lock:
+                for idx in indices:
+                    key = supply_data["supply_keys"][idx]
+                    current_qty = refresh_supply_by_city(session, req.get("Type"), key[0], key[1])
+                    for supply in supply_data["local_supply"]:
+                        if supply["key"] == key:
+                            supply["quantity"] = current_qty
+                            break
+                    if current_qty <= 0:
+                        continue
+                    use = min(current_qty, remaining)
+                    if dispatch(session, req.get("Type"), key[0], key[1], call.get("county"), call.get("city"), use, params.debug_mode):
+                        for supply in supply_data["local_supply"]:
+                            if supply["key"] == key:
+                                supply["quantity"] -= use
+                                break
+                        remaining -= use
+                        local_dispatch_count += use
+                        if params.debug_mode:
+                            logger.debug("Dispatch count updated: {}", local_dispatch_count)
+                        if remaining <= 0:
+                            break
+                    else:
+                        logger.error("Dispatch error for {} at {} {}.", req.get("Type"), call.get("city"), call.get("county"))
+            if remaining > 0:
+                logger.warning("Not fully dispatched for {} at {} {}; missing {} units.", req.get("Type"), call.get("city"), call.get("county"), remaining)
+        with active_lock:
             active_count -= 1
-
-    # Continuous loop for fetching and processing emergencies
+            logger.info("Processed emergency at {} {}. Active: {}", call.get("city"), call.get("county"), active_count)
     while True:
         if STOP_EVENT.is_set():
             break
         PAUSE_EVENT.wait()
-
-        # Local dispatch target reached
         if local_dispatch_count >= params.targetDispatches:
-            break
-
-        # Periodically check backend for target fulfillment
-        if time.time() - last_status_check >= params.status_interval:
-            st = _get_status(SESSION)
-            if st and st.get("totalDispatches", 0) >= params.targetDispatches:
-                break
-            last_status_check = time.time()
-
-        # If we can handle more concurrent emergencies
-        with lock:
-            curr = active_count
-        if curr < params.maxActiveCalls:
-            try:
-                call = _get_next_emergency(SESSION)
-            except Exception as e:
-                logger.error(f"Error fetching call: {e}")
+            stop_fetching = True
+            pending = get_next_emergency(session)
+            if pending:
+                logger.warning("Pending emergency in queue: {}. Waiting for it to be processed.", pending)
                 time.sleep(params.poll_interval)
                 continue
-            if call:
-                with lock:
-                    active_count += 1
-                futures.append(pool.submit(process_emergency, call))
+            else:
+                logger.info("Target reached and no pending emergencies.")
+                break
+        if not stop_fetching:
+            with active_lock:
+                current = active_count
+            if current < params.maxActiveCalls:
+                emergency = get_next_emergency(session)
+                if emergency:
+                    with active_lock:
+                        active_count += 1
+                    futures.append(pool.submit(process_emergency, emergency))
+                    logger.info("Submitted emergency at {} {}. Active: {}", emergency.get("city"), emergency.get("county"), active_count)
+                else:
+                    time.sleep(params.poll_interval)
             else:
                 time.sleep(params.poll_interval)
-        else:
-            time.sleep(params.poll_interval)
-
-        # Clean up completed futures
         futures = [f for f in futures if not f.done()]
-
-    # Stop simulation on backend
-    stop_resp = safe_post(SESSION, f"{SESSION.base_url}/control/stop")
-    if not stop_resp or not stop_resp.ok:
-        logger.error(f"Stop failed: {stop_resp.status_code if stop_resp else 'No response'}")
+        if time.time() - last_status_check >= params.status_interval:
+            status = get_status(session)
+            if status and status.get("totalDispatches", 0) >= params.targetDispatches:
+                logger.info("Remote target reached.")
+                stop_fetching = True
+            last_status_check = time.time()
+    stop_resp = request_with_retry(session, "POST", f"{session.base_url}/control/stop", timeout=5)
+    if stop_resp:
+        logger.info("Simulation stopped: {}", stop_resp.json())
+    else:
+        logger.error("Stop failed.")
     STOP_EVENT.clear()
 
-# Entry point for running this script independently
-if __name__ == '__main__':
-    params = SimulationParams(api_url="http://localhost:5000", seed="test", targetDispatches=10, maxActiveCalls=5)
+if __name__ == "__main__":
+    params = SimulationParams(seed="mySeed", targetDispatches=10, maxActiveCalls=2)
     run_simulation(params)
