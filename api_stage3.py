@@ -1,4 +1,12 @@
+import os
+import time
 import threading
+import requests
+from concurrent.futures import ThreadPoolExecutor
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from loguru import logger
+from scipy.spatial import KDTree
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -38,16 +46,11 @@ class APIParams(BaseModel):
 
 # Function to spawn a simulation thread without blocking the main server
 def start_simulation_thread(params: APIParams):
-    sim_params = SimulationParams(
-        api_url=params.api_url,
-        seed=params.seed,
-        targetDispatches=params.targetDispatches,
-        maxActiveCalls=params.maxActiveCalls,
-        poll_interval=params.poll_interval,
-        status_interval=params.status_interval
-    )
-    thread = threading.Thread(target=run_simulation, args=(sim_params,), daemon=True)
-    thread.start()
+    global simulation_instance
+    if simulation_instance is None or not simulation_instance.thread.is_alive():
+        sp = SimulationParams(api_url=params.api_url, seed=params.seed, targetDispatches=params.targetDispatches, maxActiveCalls=params.maxActiveCalls, poll_interval=params.poll_interval, status_interval=params.status_interval, emergency_types=params.emergency_types, debug_mode=params.debug_mode)
+        simulation_instance = Simulation(sp)
+        simulation_instance.start()
 
 # Basic health check endpoint for monitoring
 @app.get("/health")
@@ -63,25 +66,33 @@ def simulate(params: APIParams, background_tasks: BackgroundTasks):
 # Pause simulation execution
 @app.post("/simulate/pause")
 def pause():
-    pause_simulation()
-    return {"status": "simulation paused"}
+    if simulation_instance and simulation_instance.thread.is_alive():
+        simulation_instance.pause()
+        return {"status": "simulation paused"}
+    raise HTTPException(status_code=400, detail="Simulation not running")
 
 # Resume a paused simulation
 @app.post("/simulate/resume")
 def resume():
-    resume_simulation()
-    return {"status": "simulation resumed"}
+    if simulation_instance and simulation_instance.thread.is_alive():
+        simulation_instance.resume()
+        return {"status": "simulation resumed"}
+    raise HTTPException(status_code=400, detail="Simulation not running")
 
 # Force stop the simulation
 @app.post("/simulate/stop")
 def stop():
-    stop_simulation()
-    return {"status": "simulation stopped"}
+    if simulation_instance and simulation_instance.thread.is_alive():
+        simulation_instance.stop()
+        return {"status": "simulation stop requested"}
+    raise HTTPException(status_code=400, detail="Simulation not running")
 
 # Retrieve the current status of the simulation
 @app.get("/simulate/status")
-def simulation_status():
-    s = get_status()
+def simulation_status(api_url: str = None):
+    base_url = api_url or os.environ.get("API_BASE_URL", "http://localhost:5000")
+    session = create_session(base_url)
+    s = get_status(session)
     if s is None:
         raise HTTPException(status_code=500, detail="Error fetching simulation status")
     return s
