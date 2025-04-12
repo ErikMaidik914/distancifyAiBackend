@@ -3,17 +3,26 @@ from concurrent.futures import ThreadPoolExecutor
 from loguru import logger
 from scipy.spatial import KDTree
 
+# Base API endpoint for simulation backend
 BASE = "http://localhost:5000"
-DEBUG_MODE = False
+DEBUG_MODE = False  # Set to True to enable detailed logs for debugging
 
+# Global session and locks for thread-safe access
 session = requests.Session()
 active_lock = threading.Lock()
 supply_lock = threading.Lock()
+
+# Global counters
 active_count = 0
 local_dispatch_count = 0
+
+# Emergency types supported in this stage
 emergency_types = ["Medical", "Fire", "Police"]
+
+# A dictionary that will hold supply data for each emergency type
 supplies = {}
 
+# Initializes the supply for each emergency type and builds a KDTree for spatial lookup
 def initialize_supply():
     global supplies
     for etype in emergency_types:
@@ -26,17 +35,33 @@ def initialize_supply():
             supply_points = []
             for entry in data:
                 key = (entry["county"], entry["city"])
-                local_supply[key] = {"quantity": entry["quantity"], "latitude": entry["latitude"], "longitude": entry["longitude"]}
+                local_supply[key] = {
+                    "quantity": entry["quantity"],
+                    "latitude": entry["latitude"],
+                    "longitude": entry["longitude"]
+                }
                 supply_keys.append(key)
                 supply_points.append((entry["latitude"], entry["longitude"]))
             kdtree = KDTree(supply_points) if supply_points else None
-            supplies[etype] = {"local_supply": local_supply, "supply_keys": supply_keys, "supply_points": supply_points, "kdtree": kdtree}
+            supplies[etype] = {
+                "local_supply": local_supply,
+                "supply_keys": supply_keys,
+                "supply_points": supply_points,
+                "kdtree": kdtree
+            }
             logger.info("{} supply loaded and KDTree built.", etype)
         else:
             logger.error("{} supply loading failed: {} {}", etype, r.status_code, r.text)
 
+# Sends a dispatch request to the backend
 def dispatch(etype, srcCounty, srcCity, tgtCounty, tgtCity, qty):
-    data = {"sourceCounty": srcCounty, "sourceCity": srcCity, "targetCounty": tgtCounty, "targetCity": tgtCity, "quantity": qty}
+    data = {
+        "sourceCounty": srcCounty,
+        "sourceCity": srcCity,
+        "targetCounty": tgtCounty,
+        "targetCity": tgtCity,
+        "quantity": qty
+    }
     endpoint = f"{BASE}/{etype.lower()}/dispatch"
     r = session.post(endpoint, json=data)
     if r.ok:
@@ -46,6 +71,7 @@ def dispatch(etype, srcCounty, srcCity, tgtCounty, tgtCity, qty):
     logger.error("Dispatch failed for {} from {} {} to {} {}: {} {}", etype, srcCity, srcCounty, tgtCity, tgtCounty, r.status_code, r.text)
     return False
 
+# Processes a single emergency call: finds the nearest supplies and dispatches required units
 def process_emergency(call):
     global local_dispatch_count, active_count
     for req in call.get("requests", []):
@@ -83,6 +109,7 @@ def process_emergency(call):
         active_count -= 1
         logger.info("Processed emergency at {} {}. Active: {}", call["city"], call["county"], active_count)
 
+# Retrieves the next emergency call from the backend
 def get_next_emergency():
     r = session.get(f"{BASE}/calls/next")
     if r.status_code == 404:
@@ -96,6 +123,7 @@ def get_next_emergency():
         logger.error("Error calling /calls/next: {} {}", r.status_code, r.text)
     return None
 
+# Retrieves the current simulation status from the backend
 def get_status():
     r = session.get(f"{BASE}/control/status")
     if r.ok:
@@ -103,6 +131,7 @@ def get_status():
     logger.error("Error fetching status: {} {}", r.status_code, r.text)
     return None
 
+# Main simulation loop
 def main(seed="default", targetDispatches=100, maxActiveCalls=15, poll_interval=0.3, status_interval=5):
     reset_url = f"{BASE}/control/reset?seed={seed}&targetDispatches={targetDispatches}&maxActiveCalls={maxActiveCalls}"
     r = session.post(reset_url)
@@ -110,11 +139,15 @@ def main(seed="default", targetDispatches=100, maxActiveCalls=15, poll_interval=
         logger.error("Reset failed: {} {}", r.status_code, r.text)
         return
     logger.info("Simulation reset: {}", r.json())
+
+    # Prepare supply data and execution thread pool
     initialize_supply()
     executor = ThreadPoolExecutor(max_workers=maxActiveCalls)
     futures = []
     global active_count, local_dispatch_count
     last_status_check = time.time()
+
+    # Continuous simulation loop
     while True:
         if local_dispatch_count >= targetDispatches:
             logger.info("Local target reached: {}.", local_dispatch_count)
@@ -138,12 +171,17 @@ def main(seed="default", targetDispatches=100, maxActiveCalls=15, poll_interval=
                 time.sleep(poll_interval)
         else:
             time.sleep(poll_interval)
+
+        # Remove completed tasks
         futures = [f for f in futures if not f.done()]
+
+    # Final stop request
     stop = session.post(f"{BASE}/control/stop")
     if stop.ok:
         logger.info("Simulation stopped: {}", stop.json())
     else:
         logger.error("Stop failed: {} {}", stop.status_code, stop.text)
 
+# Entry point for script execution
 if __name__ == "__main__":
     main("mySeed", 10000, 1000)
