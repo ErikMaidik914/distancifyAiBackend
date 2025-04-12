@@ -8,10 +8,12 @@ from urllib3.util.retry import Retry
 from loguru import logger
 from scipy.spatial import KDTree
 
+# Global control events for simulation flow
 PAUSE_EVENT = threading.Event()
-PAUSE_EVENT.set()
-STOP_EVENT = threading.Event()
+PAUSE_EVENT.set()            # Initially allow simulation to run
+STOP_EVENT = threading.Event()  # Used to interrupt and stop the simulation
 
+# Class that holds configuration for a simulation run
 class SimulationParams:
     def __init__(self, api_url=None, seed="default", targetDispatches=100, maxActiveCalls=15,
                  poll_interval=0.3, status_interval=5, emergency_types=None, debug_mode=False):
@@ -24,6 +26,7 @@ class SimulationParams:
         self.emergency_types = emergency_types or ["Medical", "Fire", "Police", "Rescue", "Utility"]
         self.debug_mode = debug_mode
 
+# Create a session with retry logic for resilience
 def create_session(base_url, retries=3, backoff=0.5):
     s = requests.Session()
     r = Retry(total=retries, backoff_factor=backoff, status_forcelist=[500, 502, 503, 504])
@@ -33,6 +36,7 @@ def create_session(base_url, retries=3, backoff=0.5):
     s.base_url = base_url
     return s
 
+# Load initial supply data for each emergency type and index with KDTree
 def initialize_supply(session, emergency_types):
     supplies = {}
     for etype in emergency_types:
@@ -45,19 +49,35 @@ def initialize_supply(session, emergency_types):
             supply_points = []
             for entry in data:
                 key = (entry["county"], entry["city"])
-                local_supply[key] = {"quantity": entry["quantity"], "lat": entry["latitude"], "lon": entry["longitude"]}
+                local_supply[key] = {
+                    "quantity": entry["quantity"],
+                    "lat": entry["latitude"],
+                    "lon": entry["longitude"]
+                }
                 supply_keys.append(key)
                 supply_points.append((entry["latitude"], entry["longitude"]))
             tree = KDTree(supply_points) if supply_points else None
-            supplies[etype] = {"local_supply": local_supply, "supply_keys": supply_keys, "supply_points": supply_points, "tree": tree}
+            supplies[etype] = {
+                "local_supply": local_supply,
+                "supply_keys": supply_keys,
+                "supply_points": supply_points,
+                "tree": tree
+            }
             logger.info("{} supply loaded.", etype)
         else:
             logger.error("{} supply loading failed: {} {}", etype, resp.status_code, resp.text)
     return supplies
 
+# Send a dispatch request to the simulation backend
 def dispatch(session, etype, srcCounty, srcCity, tgtCounty, tgtCity, qty, debug_mode=False):
     url = f"{session.base_url}/{etype.lower()}/dispatch"
-    payload = {"sourceCounty": srcCounty, "sourceCity": srcCity, "targetCounty": tgtCounty, "targetCity": tgtCity, "quantity": qty}
+    payload = {
+        "sourceCounty": srcCounty,
+        "sourceCity": srcCity,
+        "targetCounty": tgtCounty,
+        "targetCity": tgtCity,
+        "quantity": qty
+    }
     resp = session.post(url, json=payload)
     if resp.ok:
         if debug_mode:
@@ -66,6 +86,7 @@ def dispatch(session, etype, srcCounty, srcCity, tgtCounty, tgtCity, qty, debug_
     logger.error("Dispatch failed for {} from {} {} to {} {}: {} {}", etype, srcCity, srcCounty, tgtCity, tgtCounty, resp.status_code, resp.text)
     return False
 
+# Get the next emergency call from the API
 def get_next_emergency(session):
     url = f"{session.base_url}/calls/next"
     resp = session.get(url)
@@ -80,6 +101,7 @@ def get_next_emergency(session):
         logger.error("Error calling /calls/next: {} {}", resp.status_code, resp.text)
     return None
 
+# Get current global simulation status from the API
 def get_status(session):
     url = f"{session.base_url}/control/status"
     resp = session.get(url)
@@ -88,15 +110,22 @@ def get_status(session):
     logger.error("Error fetching status: {} {}", resp.status_code, resp.text)
     return None
 
+# Main simulation loop
 def run_simulation(params):
     session = create_session(params.api_url)
+
+    # Reset backend simulation with configuration
     reset_url = f"{session.base_url}/control/reset?seed={params.seed}&targetDispatches={params.targetDispatches}&maxActiveCalls={params.maxActiveCalls}"
     r = session.post(reset_url)
     if not r.ok:
         logger.error("Reset failed: {} {}", r.status_code, r.text)
         return
     logger.info("Simulation reset: {}", r.json())
+
+    # Load supply for all emergency types and initialize KDTree
     supplies = initialize_supply(session, params.emergency_types)
+
+    # Shared state and thread pool
     active_lock = threading.Lock()
     supply_lock = threading.Lock()
     active_count = 0
@@ -104,6 +133,8 @@ def run_simulation(params):
     pool = ThreadPoolExecutor(max_workers=params.maxActiveCalls)
     futures = []
     last_status_check = time.time()
+
+    # Function to handle a single emergency request
     def process_emergency(call):
         nonlocal active_count, local_dispatch_count
         for req in call.get("requests", []):
@@ -140,6 +171,8 @@ def run_simulation(params):
         with active_lock:
             active_count -= 1
             logger.info("Processed emergency at {} {}. Active: {}", call["city"], call["county"], active_count)
+
+    # Main dispatching loop
     while True:
         if STOP_EVENT.is_set():
             break
@@ -167,13 +200,18 @@ def run_simulation(params):
         else:
             time.sleep(params.poll_interval)
         futures = [f for f in futures if not f.done()]
+
+    # Stop simulation on backend
     stop_resp = session.post(f"{session.base_url}/control/stop")
     if stop_resp.ok:
         logger.info("Simulation stopped: {}", stop_resp.json())
     else:
         logger.error("Stop failed: {} {}", stop_resp.status_code, stop_resp.text)
+
+    # Reset stop flag for future runs
     STOP_EVENT.clear()
 
+# Run simulation if the script is executed directly
 if __name__ == "__main__":
     params = SimulationParams(seed="mySeed", targetDispatches=100, maxActiveCalls=15)
     run_simulation(params)
