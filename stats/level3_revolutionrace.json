@@ -1,0 +1,19 @@
+{
+  "status": "Finished",
+  "runningTime": "00:00:19.5798055",
+  "seed": "revolutionrace",
+  "requestCount": 0,
+  "maxActiveCalls": 100,
+  "totalDispatches": 10001,
+  "targetDispatches": 10000,
+  "distance": 23924.880093451116,
+  "penalty": 0,
+  "httpRequests": 4089,
+  "emulatorVersion": 2,
+  "signature": "Finished|00:00:19.5798055|revolutionrace|0|100|10001|10000|23924.880093451116|0|4089|2|0|0",
+  "checksum": "df474bc98d2e8ee6a271d3b028d2fceead226000d8e9a930bde5fef578650291",
+  "errors": {
+    "missed": 0,
+    "overDispatched": 0
+  }
+}

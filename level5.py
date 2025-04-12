@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import time
 import threading
@@ -9,6 +10,7 @@ from urllib3.util.retry import Retry
 from loguru import logger
 from scipy.spatial import KDTree
 from typing import Any, Dict, Optional
+import argparse
 
 class SimulationParams:
     def __init__(self, api_url: Optional[str] = None, seed: str = "default", targetDispatches: int = 100,
@@ -37,16 +39,15 @@ class Simulation:
         self.last_status_check = time.time()
         self.session = self.create_session(self.params.api_url)
         self.configure_signal_handlers()
-        # Counters to adjust polling frequency for /calls/next when no emergency is returned.
         self.consecutive_no_emergency = 0
-        self.max_poll_sleep = 5  # Maximum sleep time in seconds
+        self.max_poll_sleep = 5
 
     def configure_signal_handlers(self) -> None:
         signal.signal(signal.SIGTERM, self.handle_shutdown)
         signal.signal(signal.SIGINT, self.handle_shutdown)
 
     def handle_shutdown(self, signum, frame) -> None:
-        logger.info("Received shutdown signal: {}. Initiating graceful shutdown.", signum)
+        logger.info("Shutdown signal received: {}. Stopping simulation.", signum)
         self.stop_event.set()
 
     def create_session(self, base_url: str, retries: int = 3, backoff: float = 0.5) -> requests.Session:
@@ -63,18 +64,56 @@ class Simulation:
         for attempt in range(max_retries):
             try:
                 response = self.session.request(method, url, **kwargs)
-                # For the /calls/next endpoint, a 404 signifies "end" – return immediately.
                 if "/calls/next" in url and response.status_code == 404:
                     return response
                 if response.ok:
                     return response
-                if response.text and "Not started" in response.text:
-                    logger.error("Request {} {} returned 'Not started'.", method, url)
-                    return None
+                if response.status_code == 401:
+                    logger.info("Token expired, refreshing token...")
+                    if not self.auth_refresh():
+                        logger.error("Token refresh failed.")
+                        return None
+                    continue
                 logger.error("Request {} {} failed attempt {}: {} {}", method, url, attempt + 1, response.status_code, response.text)
             except Exception as e:
                 logger.exception("Request {} {} error attempt {}: {}", method, url, attempt + 1, e)
             time.sleep(backoff * (2 ** attempt))
+        return None
+
+    def auth_login(self) -> Optional[Dict[str, Any]]:
+        login_url = f"{self.session.base_url}/auth/login"
+        payload = {"username": "distancify", "password": "hackathon"}
+        response = self.request_with_retry("POST", login_url, json=payload, timeout=5)
+        if response:
+            try:
+                data = response.json()
+            except Exception as e:
+                logger.exception("Error parsing login response: {}", e)
+                return None
+            self.session._token = data.get("token")
+            self.session._refresh_token = data.get("refreshToken")
+            if self.session._token:
+                self.session.headers.update({"Authorization": "Bearer " + self.session._token})
+                return data
+        logger.error("Login failed: {}", response.text if response else "No response")
+        return None
+
+    def auth_refresh(self) -> Optional[Dict[str, Any]]:
+        refresh_url = f"{self.session.base_url}/auth/refreshtoken"
+        headers = {"refresh_token": self.session._refresh_token}
+        response = self.request_with_retry("POST", refresh_url, headers=headers, timeout=5)
+        if response:
+            try:
+                data = response.json()
+            except Exception as e:
+                logger.exception("Error parsing refresh response: {}", e)
+                return None
+            self.session._token = data.get("token")
+            self.session._refresh_token = data.get("refreshToken")
+            if self.session._token:
+                self.session.headers.update({"Authorization": "Bearer " + self.session._token})
+                return data
+        logger.error("Refresh token failed: {}", response.text if response else "No response")
         return None
 
     def initialize_supply(self) -> None:
@@ -117,7 +156,7 @@ class Simulation:
             try:
                 data = resp.json()
             except Exception as e:
-                logger.exception("Failed to parse JSON in refresh_supply_by_city: {}", e)
+                logger.exception("Error parsing JSON in refresh_supply_by_city: {}", e)
                 return 0
             total = 0
             if isinstance(data, list):
@@ -242,8 +281,11 @@ class Simulation:
                 logger.error("Reset failed.")
                 return
             logger.info("Simulation reset: {}", r.json())
+            if not self.auth_login():
+                logger.error("Login failed.")
+                return
             self.initialize_supply()
-            with ThreadPoolExecutor(max_workers=40) as pool:
+            with ThreadPoolExecutor(max_workers=1000) as pool:
                 while True:
                     if self.stop_event.is_set():
                         break
@@ -262,14 +304,12 @@ class Simulation:
                     if current < self.params.maxActiveCalls:
                         emergency = self.get_next_emergency()
                         if emergency:
-                            # Reset backoff counter when an emergency is received.
                             self.consecutive_no_emergency = 0
                             with self.active_lock:
                                 self.active_count += 1
                             pool.submit(self.process_emergency, emergency)
                             logger.info("Submitted emergency at {} {}. Active: {}", emergency.get("city"), emergency.get("county"), self.active_count)
                         else:
-                            # Increase backoff when no emergency is found.
                             self.consecutive_no_emergency += 1
                             sleep_time = min(self.params.poll_interval * (2 ** self.consecutive_no_emergency), self.max_poll_sleep)
                             time.sleep(sleep_time)
@@ -287,14 +327,23 @@ class Simulation:
             self.stop_simulation()
 
 def main() -> None:
-    try:
-        params = SimulationParams(seed="mySeed", targetDispatches=10, maxActiveCalls=2)
-        sim = Simulation(params)
-        sim.run()
-    except Exception as e:
-        logger.exception("Fatal error in main: {}", e)
-    finally:
-        logger.info("Exiting simulation application.")
+    parser = argparse.ArgumentParser(description="Run Level 5 Simulation")
+    parser.add_argument("--api_url", type=str, default="http://localhost:5000")
+    parser.add_argument("--seed", type=str, default="default")
+    parser.add_argument("--targetDispatches", type=int, default=100)
+    parser.add_argument("--maxActiveCalls", type=int, default=15)
+    parser.add_argument("--poll_interval", type=float, default=0.3)
+    parser.add_argument("--status_interval", type=float, default=5)
+    parser.add_argument("--debug_mode", action="store_true")
+    args = parser.parse_args()
+    params = SimulationParams(api_url=args.api_url, seed=args.seed,
+                              targetDispatches=args.targetDispatches,
+                              maxActiveCalls=args.maxActiveCalls,
+                              poll_interval=args.poll_interval,
+                              status_interval=args.status_interval,
+                              debug_mode=args.debug_mode)
+    sim = Simulation(params)
+    sim.run()
 
 if __name__ == "__main__":
     main()

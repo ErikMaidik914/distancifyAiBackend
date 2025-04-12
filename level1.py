@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import time
 import threading
@@ -6,6 +7,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from loguru import logger
 from scipy.spatial import KDTree
+import argparse
 
 SESSION = None
 PAUSE_EVENT = threading.Event()
@@ -36,7 +38,7 @@ class SimulationParams:
 
 def create_session(base_url, retries=3, backoff=0.5):
     s = requests.Session()
-    r = Retry(total=retries, backoff_factor=backoff, status_forcelist=[500, 502, 503, 504])
+    r = Retry(total=retries, backoff_factor=backoff, status_forcelist=[500,502,503,504])
     a = HTTPAdapter(max_retries=r)
     s.mount("http://", a)
     s.mount("https://", a)
@@ -187,5 +189,17 @@ def run_simulation(params):
     logger.info("Simulation finished")
     
 if __name__ == '__main__':
-    params = SimulationParams(api_url="http://localhost:5000")
+    parser = argparse.ArgumentParser(description="Run Level 1 Simulation")
+    parser.add_argument("--api_url", type=str, default="http://localhost:5000")
+    parser.add_argument("--seed", type=str, default="default")
+    parser.add_argument("--targetDispatches", type=int, default=100)
+    parser.add_argument("--maxActiveCalls", type=int, default=15)
+    parser.add_argument("--poll_interval", type=float, default=0.3)
+    parser.add_argument("--status_interval", type=float, default=5)
+    args = parser.parse_args()
+    params = SimulationParams(api_url=args.api_url, seed=args.seed,
+                              targetDispatches=args.targetDispatches,
+                              maxActiveCalls=args.maxActiveCalls,
+                              poll_interval=args.poll_interval,
+                              status_interval=args.status_interval)
     run_simulation(params)

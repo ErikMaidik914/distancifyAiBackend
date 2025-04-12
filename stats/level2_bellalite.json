@@ -1,0 +1,19 @@
+{
+  "status": "Finished",
+  "runningTime": "00:00:20.1019466",
+  "seed": "bellalite",
+  "requestCount": 0,
+  "maxActiveCalls": 10000,
+  "totalDispatches": 10000,
+  "targetDispatches": 10000,
+  "distance": 22954.922181014375,
+  "penalty": 0,
+  "httpRequests": 4063,
+  "emulatorVersion": 2,
+  "signature": "Finished|00:00:20.1019466|bellalite|0|10000|10000|10000|22954.922181014375|0|4063|2|0|0",
+  "checksum": "f72e06d3fe17afe4578d732ba6076cc9d62f4acd8d969e11de896e59fa3f0f0b",
+  "errors": {
+    "missed": 0,
+    "overDispatched": 0
+  }
+}

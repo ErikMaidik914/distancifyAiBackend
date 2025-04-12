@@ -1,0 +1,19 @@
+{
+  "status": "Finished",
+  "runningTime": "00:03:23.8775817",
+  "seed": "jaktia",
+  "requestCount": 0,
+  "maxActiveCalls": 3,
+  "totalDispatches": 10000,
+  "targetDispatches": 10000,
+  "distance": 22899.522979806767,
+  "penalty": 0,
+  "httpRequests": 4077,
+  "emulatorVersion": 2,
+  "signature": "Finished|00:03:23.8775817|jaktia|0|3|10000|10000|22899.522979806767|0|4077|2|1|0",
+  "checksum": "8e5888934dfa917e8325c25cc5d6d0ce8257e5fd4a3580608bf97ad56a136339",
+  "errors": {
+    "missed": 1,
+    "overDispatched": 0
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "status": "Finished",
+  "runningTime": "00:03:01.5452509",
+  "seed": "jollyroom",
+  "requestCount": 0,
+  "maxActiveCalls": 1000,
+  "totalDispatches": 100000,
+  "targetDispatches": 100000,
+  "distance": 226933.23422875017,
+  "penalty": 0,
+  "httpRequests": 40084,
+  "emulatorVersion": 2,
+  "signature": "Finished|00:03:01.5452509|jollyroom|0|1000|100000|100000|226933.23422875017|0|40084|2|0|0",
+  "checksum": "45da10d94005fc911636e07ab3b0539842a1a5da0a0cfeac6886b2a27f2f5e5c",
+  "errors": {
+    "missed": 0,
+    "overDispatched": 0
+  }
+}
