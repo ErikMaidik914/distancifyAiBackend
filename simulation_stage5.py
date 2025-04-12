@@ -265,6 +265,7 @@ def run_simulation(params):
         logger.info("Simulation stopped: {}", stop_resp.json())
     else:
         logger.error("Stop failed.")
+    logger.remove()
     STOP_EVENT.clear()
 
 if __name__ == "__main__":
