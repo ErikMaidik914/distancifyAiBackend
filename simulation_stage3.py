@@ -87,6 +87,19 @@ def get_status(session):
     logger.error("Error fetching status: {} {}", resp.status_code, resp.text)
     return None
 
+def pause_simulation():
+    PAUSE_EVENT.clear()
+    logger.info("Simulation paused")
+
+def resume_simulation():
+    PAUSE_EVENT.set()
+    logger.info("Simulation resumed")
+
+def stop_simulation():
+    STOP_EVENT.set()
+    PAUSE_EVENT.set()
+    logger.info("Simulation stop requested")
+
 def run_simulation(params):
     session = create_session(params.api_url)
     reset_url = f"{session.base_url}/control/reset?seed={params.seed}&targetDispatches={params.targetDispatches}&maxActiveCalls={params.maxActiveCalls}"
@@ -180,6 +193,7 @@ def run_simulation(params):
     else:
         logger.error("Stop failed: {} {}", stop_resp.status_code, stop_resp.text)
     STOP_EVENT.clear()
+    PAUSE_EVENT.set()
 
 if __name__ == "__main__":
     params = SimulationParams(seed="mySeed", targetDispatches=100, maxActiveCalls=10)
