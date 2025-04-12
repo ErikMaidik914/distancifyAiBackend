@@ -13,7 +13,8 @@ PAUSE_EVENT.set()
 STOP_EVENT = threading.Event()
 
 class SimulationParams:
-    def __init__(self, api_url=None, seed="default", targetDispatches=100, maxActiveCalls=15, poll_interval=0.3, status_interval=5, emergency_types=None, debug_mode=False):
+    def __init__(self, api_url=None, seed="default", targetDispatches=100, maxActiveCalls=15,
+                 poll_interval=0.3, status_interval=5, emergency_types=None, debug_mode=False):
         self.api_url = api_url or os.environ.get("API_BASE_URL", "http://localhost:5000")
         self.seed = seed
         self.targetDispatches = targetDispatches
@@ -87,19 +88,6 @@ def get_status(session):
     logger.error("Error fetching status: {} {}", resp.status_code, resp.text)
     return None
 
-def pause_simulation():
-    PAUSE_EVENT.clear()
-    logger.info("Simulation paused")
-
-def resume_simulation():
-    PAUSE_EVENT.set()
-    logger.info("Simulation resumed")
-
-def stop_simulation():
-    STOP_EVENT.set()
-    PAUSE_EVENT.set()
-    logger.info("Simulation stop requested")
-
 def run_simulation(params):
     session = create_session(params.api_url)
     reset_url = f"{session.base_url}/control/reset?seed={params.seed}&targetDispatches={params.targetDispatches}&maxActiveCalls={params.maxActiveCalls}"
@@ -116,7 +104,6 @@ def run_simulation(params):
     pool = ThreadPoolExecutor(max_workers=params.maxActiveCalls)
     futures = []
     last_status_check = time.time()
-
     def process_emergency(call):
         nonlocal active_count, local_dispatch_count
         for req in call.get("requests", []):
@@ -131,35 +118,28 @@ def run_simulation(params):
             pt = (call["latitude"], call["longitude"])
             distances, indices = supply_data["tree"].query(pt, k=len(supply_data["supply_points"]))
             remaining = needed
-            for idx in indices:
-                if remaining <= 0:
-                    break
-                with supply_lock:
-                    allowed = params.targetDispatches - local_dispatch_count
-                    if allowed <= 0:
-                        remaining = 0
-                        break
+            with supply_lock:
+                for idx in indices:
                     key = supply_data["supply_keys"][idx]
                     available = supply_data["local_supply"][key]["quantity"]
                     if available <= 0:
                         continue
-                    use = min(available, remaining, allowed)
-                    local_dispatch_count += use
-                    supply_data["local_supply"][key]["quantity"] -= use
-                success = dispatch(session, req["Type"], key[0], key[1], call["county"], call["city"], use, params.debug_mode)
-                if success:
-                    remaining -= use
-                else:
-                    with supply_lock:
-                        local_dispatch_count -= use
-                        supply_data["local_supply"][key]["quantity"] += use
-                    logger.error("Dispatch error for {} at {} {}.", req["Type"], call["city"], call["county"])
+                    use = min(available, remaining)
+                    if dispatch(session, req["Type"], key[0], key[1], call["county"], call["city"], use, params.debug_mode):
+                        supply_data["local_supply"][key]["quantity"] -= use
+                        remaining -= use
+                        local_dispatch_count += use
+                        if params.debug_mode:
+                            logger.debug("Dispatch count updated: {}", local_dispatch_count)
+                        if remaining <= 0:
+                            break
+                    else:
+                        logger.error("Dispatch error for {} at {} {}.", req["Type"], call["city"], call["county"])
             if remaining > 0:
                 logger.warning("Not fully dispatched for {} at {} {}; missing {} units.", req["Type"], call["city"], call["county"], remaining)
         with active_lock:
             active_count -= 1
             logger.info("Processed emergency at {} {}. Active: {}", call["city"], call["county"], active_count)
-
     while True:
         if STOP_EVENT.is_set():
             break
@@ -193,8 +173,7 @@ def run_simulation(params):
     else:
         logger.error("Stop failed: {} {}", stop_resp.status_code, stop_resp.text)
     STOP_EVENT.clear()
-    PAUSE_EVENT.set()
 
 if __name__ == "__main__":
-    params = SimulationParams(seed="mySeed", targetDispatches=100, maxActiveCalls=10)
+    params = SimulationParams(seed="mySeed", targetDispatches=100, maxActiveCalls=15)
     run_simulation(params)
