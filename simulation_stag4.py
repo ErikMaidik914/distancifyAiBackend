@@ -37,6 +37,9 @@ class Simulation:
         self.last_status_check = time.time()
         self.session = self.create_session(self.params.api_url)
         self.configure_signal_handlers()
+        # Counters to adjust polling frequency for /calls/next when no emergency is returned.
+        self.consecutive_no_emergency = 0
+        self.max_poll_sleep = 5  # Maximum sleep time in seconds
 
     def configure_signal_handlers(self) -> None:
         signal.signal(signal.SIGTERM, self.handle_shutdown)
@@ -60,6 +63,9 @@ class Simulation:
         for attempt in range(max_retries):
             try:
                 response = self.session.request(method, url, **kwargs)
+                # For the /calls/next endpoint, a 404 signifies "end" – return immediately.
+                if "/calls/next" in url and response.status_code == 404:
+                    return response
                 if response.ok:
                     return response
                 if response.text and "Not started" in response.text:
@@ -256,12 +262,17 @@ class Simulation:
                     if current < self.params.maxActiveCalls:
                         emergency = self.get_next_emergency()
                         if emergency:
+                            # Reset backoff counter when an emergency is received.
+                            self.consecutive_no_emergency = 0
                             with self.active_lock:
                                 self.active_count += 1
                             pool.submit(self.process_emergency, emergency)
                             logger.info("Submitted emergency at {} {}. Active: {}", emergency.get("city"), emergency.get("county"), self.active_count)
                         else:
-                            time.sleep(self.params.poll_interval)
+                            # Increase backoff when no emergency is found.
+                            self.consecutive_no_emergency += 1
+                            sleep_time = min(self.params.poll_interval * (2 ** self.consecutive_no_emergency), self.max_poll_sleep)
+                            time.sleep(sleep_time)
                     else:
                         time.sleep(self.params.poll_interval)
                     if time.time() - self.last_status_check >= self.params.status_interval:
